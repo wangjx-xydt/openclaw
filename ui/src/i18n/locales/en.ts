@@ -5793,9 +5793,13 @@ export const en: TranslationMap = {
     },
     goals: {
       edit: "Edit goal",
+      editChip: "Edit",
       pause: "Pause goal",
+      pauseChip: "Pause",
       resume: "Resume goal",
+      resumeChip: "Resume",
       clear: "Clear goal",
+      clearChip: "Clear",
       showDetails: "Show goal details",
       hideDetails: "Hide goal details",
     },
