@@ -716,6 +716,7 @@ describeConformance("MCP App Control UI and standalone host conformance", () => 
           await fixture.configure({ ...spec, releasePath });
           const startedAtMs = Date.now();
           const networkStart = diagnostics.length;
+          const activeLeasesBefore = runtime.activeLeases;
           const observation: Record<string, unknown> = { scenario: spec.scenario, startedAtMs };
           cancellationResults.push(observation);
           try {
@@ -782,14 +783,27 @@ describeConformance("MCP App Control UI and standalone host conformance", () => 
             expect(events.filter((event) => event.event === "tool-complete")).toMatchObject(
               spec.cooperative ? [] : [{ requestId: call.id, aborted: true }],
             );
-            // Fixture stdio and Playwright network events arrive independently.
-            await expect
-              .poll(() =>
-                diagnostics
-                  .slice(networkStart)
-                  .filter((event) => event.event === "requestfailed" && event.method === "POST"),
-              )
-              .toHaveLength(1);
+            if (spec.action === "pagehide") {
+              // Navigation can discard the old document's network callbacks. The
+              // correlated disconnect and released request leases prove cancellation.
+              expect(
+                events.filter((event) => event.event === "tool-cancellation-observed"),
+                spec.scenario,
+              ).toMatchObject([{ requestId: call.id, clientDisconnected: true }]);
+              await expect.poll(() => getMcpAppViewLease(viewId, runtime)?.activeRequests).toBe(0);
+              expect(runtime.activeLeases, spec.scenario).toBe(activeLeasesBefore);
+              expect(app.isDetached()).toBe(true);
+              expect(standalonePage.url()).toBe("about:blank");
+            } else {
+              // Fixture stdio and Playwright network events arrive independently.
+              await expect
+                .poll(() =>
+                  diagnostics
+                    .slice(networkStart)
+                    .filter((event) => event.event === "requestfailed" && event.method === "POST"),
+                )
+                .toHaveLength(1);
+            }
           } finally {
             if (releasePath) {
               await fs.writeFile(releasePath, "released");

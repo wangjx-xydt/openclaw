@@ -65,6 +65,7 @@ export type McpAppFixtureEvent = {
   tool?: string;
   invocation?: number;
   aborted?: boolean;
+  clientDisconnected?: boolean;
 };
 
 async function readMcpAppFixtureEvents(eventsPath: string): Promise<McpAppFixtureEvent[]> {
@@ -578,7 +579,8 @@ const appOnly = server.tool("app_companion", "App-only companion", async (extra)
   const callDelayMs = config.callDelayMs ?? 0;
   const invocation = ++invocations;
   const detail = { invocation, requestId: extra.requestId, scenario: request?.scenario };
-  const onAbort = () => record("tool-cancellation-observed", detail);
+  // Distinguish the caller's HTTP disconnect from the independent SDK deadline.
+  const onAbort = () => record("tool-cancellation-observed", { ...detail, clientDisconnected: extra.signal.reason === "ClientDisconnectError: HTTP client disconnected" });
   extra.signal.addEventListener("abort", onAbort, { once: true });
   record("tool-start", detail);
   try {
