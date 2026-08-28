@@ -4,8 +4,14 @@ import path from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import {
+  buildSystemdManagerPropertyOutput,
+  buildSystemdUnitPropertyOutput,
+} from "./service.test-helpers.js";
 
-const assertNoSystemOwnership = vi.hoisted(() => vi.fn(async () => {}));
+const assertNoSystemOwnership = vi.hoisted(() =>
+  vi.fn<typeof import("./systemd-system.js").assertNoSystemSystemdOwnership>(),
+);
 const busctl = vi.hoisted(() => vi.fn<typeof import("./systemd-exec.js").execBusctlUser>());
 
 vi.mock("./systemd-system.js", async (importOriginal) => ({
@@ -100,30 +106,19 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
         code: 0,
         termination: "exit",
         stderr: "",
-        stdout: (args.includes("LoadUnit")
-          ? [{ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] }]
+        stdout: args.includes("LoadUnit")
+          ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] })
           : args.includes("org.freedesktop.systemd1.Unit")
-            ? [
-                { type: "s", data: loaded ? fragmentPath : "" },
-                { type: "as", data: loaded ? dropInPaths : [] },
-                { type: "b", data: false },
-                { type: "s", data: loaded ? "loaded" : "not-found" },
-              ]
-            : [
-                {
-                  type: "a(sasbttttuii)",
-                  data: [
-                    ["/usr/bin/node", ["/usr/bin/node", "gateway"], false, 0, 0, 0, 0, 0, 0, 0],
-                  ],
-                },
-                { type: "s", data: "" },
-                { type: "as", data: ["TOKEN=manager-secret-canary"] },
-                { type: "a(sb)", data: environmentFiles },
-                { type: "as", data: [] },
-              ]
-        )
-          .map((property) => JSON.stringify(property))
-          .join("\n"),
+            ? buildSystemdUnitPropertyOutput({
+                fragmentPath: loaded ? fragmentPath : "",
+                dropInPaths: loaded ? dropInPaths : [],
+                loadState: loaded ? "loaded" : "not-found",
+              })
+            : buildSystemdManagerPropertyOutput({
+                programArguments: ["/usr/bin/node", "gateway"],
+                environment: ["TOKEN=manager-secret-canary"],
+                environmentFiles,
+              }),
       };
     });
   }
@@ -804,42 +799,6 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     expect(assertNoSystemOwnership).toHaveBeenCalledWith("openclaw-owned.service", undefined);
   });
 
-  it("checks gateway system ownership despite an inherited node-service marker", async () => {
-    assertNoSystemOwnership.mockRejectedValueOnce(
-      new Error("System systemd unit openclaw-owned.service already owns this gateway unit name."),
-    );
-
-    await expect(
-      readSystemdDefinitionMutationCapability({ ...env, OPENCLAW_SERVICE_KIND: "node" }),
-    ).resolves.toMatchObject({ kind: "sealed" });
-    expect(assertNoSystemOwnership).toHaveBeenCalledWith("openclaw-owned.service", undefined);
-  });
-
-  it.each([
-    {
-      name: "exact system-owned definition",
-      error: "System systemd unit already owns this gateway unit name",
-      kind: "sealed",
-    },
-    {
-      name: "uninspectable system definition",
-      error: "System systemd ownership could not be verified: manager-secret-canary",
-      kind: "unknown",
-    },
-    {
-      name: "unproven manager absence",
-      error: "systemctl not available; systemd user services are required",
-      kind: "unknown",
-    },
-  ])("fails closed for $name before inspecting user artifacts", async ({ error, kind }) => {
-    assertNoSystemOwnership.mockRejectedValueOnce(new Error(error));
-
-    const capability = await readSystemdDefinitionMutationCapability(env);
-
-    expect(capability).toMatchObject({ kind });
-    expect(JSON.stringify(capability)).not.toContain("manager-secret-canary");
-  });
-
   it.each([
     { parent: "unit", select: () => path.dirname(unitPath) },
     { parent: "environment", select: () => stateDir },
@@ -886,23 +845,31 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     expect(await fs.readFile(protectedPath)).toEqual(original);
   });
 
-  it.each(artifacts)(
-    "rejects a symlinked $artifact without changing its target",
-    async ({ select }) => {
-      if (select() !== unitPath) {
-        await fs.writeFile(unitPath, "[Service]\n");
-      }
-      const target = path.join(root, "operator-target");
-      await fs.writeFile(target, "operator-secret-canary\n");
-      await fs.symlink(target, select());
+  it.each([
+    ...artifacts.map(({ artifact, select }) => ({ artifact, select, fresh: false })),
+    { artifact: "fresh environment", select: () => environmentPath, fresh: true },
+  ])("rejects a symlinked $artifact without changing its target", async ({ select, fresh }) => {
+    const file = select();
+    if (file !== unitPath && !fresh) {
+      await fs.writeFile(unitPath, "[Service]\n");
+    }
+    const target = path.join(root, "operator-target");
+    await fs.writeFile(target, "operator-secret-canary\n");
+    await fs.symlink(target, file);
 
-      await expect(readSystemdDefinitionMutationCapability(env)).resolves.toMatchObject({
-        kind: "unknown",
-      });
-      await expect(stage()).rejects.toThrow("SERVICE_DEFINITION_UNKNOWN");
-      expect(await fs.readFile(target, "utf8")).toBe("operator-secret-canary\n");
-    },
-  );
+    await expect(readSystemdDefinitionMutationCapability(env)).resolves.toMatchObject({
+      kind: "unknown",
+      detail: `Refusing to rewrite symlinked managed systemd file: ${file}`,
+    });
+    await expect(stage()).rejects.toThrow(
+      `SERVICE_DEFINITION_UNKNOWN: Refusing to rewrite symlinked managed systemd file: ${file}`,
+    );
+    expect(await fs.readlink(file)).toBe(target);
+    expect(await fs.readFile(target, "utf8")).toBe("operator-secret-canary\n");
+    if (fresh) {
+      await expect(fs.stat(unitPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
 
   it("publishes the unit, backup, and generated environment without chmod or secret disclosure", async () => {
     const previous = "[Service]\nExecStart=/usr/bin/node /old/index.js gateway\n";
@@ -965,17 +932,6 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
 
     expect(await fs.readFile(environmentPath, "utf8")).toBe("");
     expect(await fs.readFile(unitPath, "utf8")).not.toContain("EnvironmentFile=");
-  });
-
-  it("restores an existing artifact through the same locked atomic owner", async () => {
-    await fs.writeFile(unitPath, "previous-definition");
-    await withSystemdDefinitionMutation(env, env, async (mutation) => {
-      const previous = mutation.snapshots.get(unitPath)!;
-      await mutation.publish(unitPath, "replacement-definition", 0o644);
-      await mutation.restore(unitPath, previous);
-    });
-
-    expect(await fs.readFile(unitPath, "utf8")).toBe("previous-definition");
   });
 
   it.each(["environment", "unit", "directory alias", "retargeted unit", "retargeted environment"])(

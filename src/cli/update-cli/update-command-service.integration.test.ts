@@ -237,6 +237,19 @@ afterEach(async () => {
 
 describe("preserved update activation with real version guards", () => {
   it.each([
+    ...(
+      [
+        { mode: "git", outcome: "healthy" },
+        { mode: "npm", outcome: "healthy" },
+        { mode: "npm", outcome: "stale retry" },
+      ] as const
+    ).map(({ mode, outcome }) => ({
+      mode,
+      outcome,
+      denial: "sealed" as const,
+      channel: "stable" as const,
+      phase: "initial",
+    })),
     ...(["git", "npm", "pnpm", "bun"] as const).flatMap((mode) =>
       (["sealed", "unknown"] as const).flatMap((denial) =>
         (mode === "git" || mode === "npm"
@@ -266,6 +279,14 @@ describe("preserved update activation with real version guards", () => {
     "handles $phase $denial denial for $channel $mode activation ($outcome)",
     async ({ mode, denial, outcome, channel, phase }) => {
       const late = phase === "late";
+      const serviceCommand = await mocks.command(process.env);
+      if (!serviceCommand) {
+        throw new Error("missing fixture command");
+      }
+      mocks.command.mockResolvedValue({
+        ...serviceCommand,
+        environment: { HOME: root, MANAGED_VALUE: "revalidated" },
+      });
       mocks.capability.mockResolvedValue(
         late ? { kind: "writable" } : { kind: denial, detail: "owner denial" },
       );
@@ -374,11 +395,12 @@ describe("preserved update activation with real version guards", () => {
           before: { version: "2026.1.1" },
           after: { version: VERSION, buildId: "new-build" },
         },
-        opts: { json: outcome === "json denial" },
+        opts: { json: outcome === "json denial" || (!late && channel === "stable") },
         refreshServiceEnv: late,
         serviceUpdateVerdict: before.serviceUpdateVerdict,
         serviceEnv: before.serviceEnv,
         gatewayPort: late ? 19001 : 19305,
+        requireRunningServiceAfterRestart: true,
         restartScriptPath: "/fixture/prepared-restart.sh",
         timeoutMs: 1000,
       });
@@ -387,9 +409,14 @@ describe("preserved update activation with real version guards", () => {
       expect(activated).toBe(allowed && !buildMismatch);
       const restarts = mocks.child.mock.calls.filter(([args]) => args.includes("restart"));
       expect(restarts).toHaveLength(allowed ? (retried ? 2 : 1) : 0);
-      for (const [args] of restarts) {
+      for (const [args, options] of restarts) {
         expect(args).toContain("--preserve-definition");
+        expect(typeof options === "object" && options.env?.MANAGED_VALUE).toBe("revalidated");
+        if (!late && channel === "stable") {
+          expect(args).toContain("--json");
+        }
       }
+      expect(mocks.start).not.toHaveBeenCalled();
       expect(mocks.child.mock.calls.filter(([args]) => args.includes("install"))).toHaveLength(
         late ? 1 : 0,
       );
@@ -409,6 +436,7 @@ describe("preserved update activation with real version guards", () => {
           ([args]) => args.expectedVersion === VERSION,
         );
         expect(verification.length).toBe(retried ? 2 : 1);
+        expect(verification.every(([args]) => args.requireRunningService === true)).toBe(true);
         expect(
           verification.every(
             ([args]) => args.expectedBuildId === (channel === "dev" ? "new-build" : undefined),

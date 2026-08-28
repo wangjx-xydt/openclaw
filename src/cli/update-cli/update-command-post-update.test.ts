@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UpdateRunResult } from "../../infra/update-runner.js";
 import { defaultRuntime } from "../../runtime.js";
 
@@ -166,7 +166,6 @@ async function finishSuccessfulPackageSwitch(params: {
     ...(params.restartEnvironment && {
       preManagedServiceStop: {
         stopped: params.stoppedForUpdate ?? true,
-        serviceMatchesMutationRoot: true,
         ...(params.sealed && {
           serviceUpdateVerdict: {
             kind: "owned",
@@ -488,125 +487,6 @@ describe("successful update finalization ordering", () => {
     }
   });
 
-  it.each([
-    ["unknown", true],
-    ["inline reset", { resetInline: true }],
-    ["environment-file reset", { resetFiles: true }],
-  ] as const)("skips unsafe metadata refresh for %s ownership", async (_, environment) => {
-    const programArguments = [
-      "/usr/bin/node",
-      "/tmp/openclaw-update/dist/index.js",
-      "gateway",
-      "--port",
-      "19305",
-    ];
-    mocks.readServiceState.mockResolvedValueOnce({
-      installed: true,
-      loadState: { status: "loaded" },
-      env: {},
-      command: {
-        programArguments,
-        managedDefinition: { programArguments },
-        managedOverrides: { environment },
-      },
-    });
-
-    vi.stubEnv("HOME", os.homedir());
-    vi.stubEnv("OPENCLAW_PROFILE", "default");
-    for (const key of ["OPENCLAW_HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"]) {
-      vi.stubEnv(key, "");
-    }
-    try {
-      await finishSuccessfulPackageSwitch({
-        previousRoot: "/tmp/openclaw-update",
-        packageRoot: "/tmp/openclaw-update",
-        restartEnvironment: process.env,
-      });
-
-      expect(mocks.restartService).toHaveBeenCalledWith(
-        expect.objectContaining({
-          shouldRestart: true,
-          refreshServiceEnv: false,
-          serviceInstallEnv: null,
-        }),
-      );
-      expect(mocks.restartService).toHaveBeenCalledWith(
-        expect.objectContaining({
-          serviceUpdateVerdict: expect.objectContaining({ refreshDefinition: false }),
-        }),
-      );
-      expect(mocks.restartService.mock.lastCall?.[0].gatewayPort).toBe(19305);
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-
-  it.each([
-    { source: "preserved ExecStart", sealed: true, args: ["--port", "19301"], expected: 19301 },
-    { source: "preserved config", sealed: true, args: [], expected: 19304 },
-    { source: "writable refresh", sealed: false, args: ["--port=19301"], expected: 19303 },
-  ])("verifies the CLI service port for $source", async ({ sealed, args, expected }) => {
-    const serviceEnv = { HOME: os.homedir() };
-    mocks.readServiceState.mockResolvedValue({
-      installed: true,
-      loadState: { status: "loaded" },
-      env: serviceEnv,
-      command: {
-        programArguments: [
-          "/usr/bin/node",
-          "/tmp/openclaw-update/dist/index.js",
-          "gateway",
-          ...args,
-        ],
-        environment: serviceEnv,
-      },
-    });
-    mocks.readConfig.mockResolvedValue({
-      ...validConfigSnapshot,
-      config: { gateway: { port: 19303 } },
-    });
-    mocks.completePluginUpdate.mockResolvedValue({
-      pluginUpdate: successfulPluginUpdate,
-      configSnapshot: { ...validConfigSnapshot, config: { gateway: { port: 19303 } } },
-    });
-    mocks.createServiceConfigIO.mockReturnValue({
-      readBestEffortConfig: async () => ({ gateway: { port: 19304 } }),
-    });
-    vi.stubEnv("HOME", os.homedir());
-    vi.stubEnv("OPENCLAW_PROFILE", "default");
-    for (const key of [
-      "OPENCLAW_HOME",
-      "OPENCLAW_STATE_DIR",
-      "OPENCLAW_CONFIG_PATH",
-      "OPENCLAW_GATEWAY_PORT",
-    ]) {
-      vi.stubEnv(key, "");
-    }
-    try {
-      await finishSuccessfulPackageSwitch({
-        previousRoot: "/tmp/openclaw-update",
-        packageRoot: "/tmp/openclaw-update",
-        restartEnvironment: { ...process.env },
-        sealed,
-      });
-    } finally {
-      vi.unstubAllEnvs();
-    }
-    const restart = mocks.restartService.mock.calls.at(-1)?.[0];
-    expect({ port: restart?.gatewayPort, refresh: restart?.refreshServiceEnv }).toEqual({
-      port: expected,
-      refresh: !sealed,
-    });
-    if (!sealed) {
-      expect(mocks.prepareRestartScript).toHaveBeenCalledWith(
-        serviceEnv,
-        expected,
-        expect.any(Array),
-      );
-      expect(mocks.createServiceConfigIO).not.toHaveBeenCalled();
-    }
-  });
-
   it("reads the preserved service config without using the caller config or writing state", async () => {
     const { createConfigIO } =
       await vi.importActual<typeof import("../../config/io.js")>("../../config/io.js");
@@ -631,76 +511,170 @@ describe("successful update finalization ordering", () => {
     }
   });
 
-  it.each(["inspection", "revalidation"] as const)(
-    "does not restart a stopped sealed service when fresh %s fails",
-    async (failure) => {
-      const error = new Error("inspection-secret-canary");
-      mocks.readServiceState.mockResolvedValue({
-        installed: true,
-        loadState: { status: "loaded" },
-        env: {},
-        command: {
-          programArguments: ["/usr/bin/node", "/tmp/openclaw-update/dist/index.js", "gateway"],
-        },
-      });
-      if (failure === "inspection") {
-        mocks.readServiceState.mockRejectedValueOnce(error);
-      } else {
-        mocks.revalidateService.mockRejectedValueOnce(error);
-      }
+  describe("managed service finalization", () => {
+    beforeEach(() => {
       vi.stubEnv("HOME", os.homedir());
       vi.stubEnv("OPENCLAW_PROFILE", "default");
       for (const key of ["OPENCLAW_HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"]) {
         vi.stubEnv(key, "");
       }
-      try {
+    });
+    afterEach(() => vi.unstubAllEnvs());
+
+    it.each([
+      ["unknown", true],
+      ["inline reset", { resetInline: true }],
+      ["environment-file reset", { resetFiles: true }],
+    ] as const)("skips unsafe metadata refresh for %s ownership", async (_, environment) => {
+      const programArguments = [
+        "/usr/bin/node",
+        "/tmp/openclaw-update/dist/index.js",
+        "gateway",
+        "--port",
+        "19305",
+      ];
+      mocks.readServiceState.mockResolvedValueOnce({
+        installed: true,
+        loadState: { status: "loaded" },
+        env: {},
+        command: {
+          programArguments,
+          managedDefinition: { programArguments },
+          managedOverrides: { environment },
+        },
+      });
+
+      await finishSuccessfulPackageSwitch({
+        previousRoot: "/tmp/openclaw-update",
+        packageRoot: "/tmp/openclaw-update",
+        restartEnvironment: process.env,
+      });
+
+      expect(mocks.restartService).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shouldRestart: true,
+          refreshServiceEnv: false,
+          serviceInstallEnv: null,
+        }),
+      );
+      expect(mocks.restartService).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serviceUpdateVerdict: expect.objectContaining({ refreshDefinition: false }),
+        }),
+      );
+      expect(mocks.restartService.mock.lastCall?.[0].gatewayPort).toBe(19305);
+    });
+
+    it.each([
+      { source: "preserved ExecStart", sealed: true, args: ["--port", "19301"], expected: 19301 },
+      { source: "preserved config", sealed: true, args: [], expected: 19304 },
+      { source: "writable refresh", sealed: false, args: ["--port=19301"], expected: 19303 },
+    ])("verifies the CLI service port for $source", async ({ sealed, args, expected }) => {
+      const serviceEnv = { HOME: os.homedir() };
+      mocks.readServiceState.mockResolvedValue({
+        installed: true,
+        loadState: { status: "loaded" },
+        env: serviceEnv,
+        command: {
+          programArguments: [
+            "/usr/bin/node",
+            "/tmp/openclaw-update/dist/index.js",
+            "gateway",
+            ...args,
+          ],
+          environment: serviceEnv,
+        },
+      });
+      mocks.readConfig.mockResolvedValue({
+        ...validConfigSnapshot,
+        config: { gateway: { port: 19303 } },
+      });
+      mocks.completePluginUpdate.mockResolvedValue({
+        pluginUpdate: successfulPluginUpdate,
+        configSnapshot: { ...validConfigSnapshot, config: { gateway: { port: 19303 } } },
+      });
+      mocks.createServiceConfigIO.mockReturnValue({
+        readBestEffortConfig: async () => ({ gateway: { port: 19304 } }),
+      });
+      vi.stubEnv("OPENCLAW_GATEWAY_PORT", "");
+      await finishSuccessfulPackageSwitch({
+        previousRoot: "/tmp/openclaw-update",
+        packageRoot: "/tmp/openclaw-update",
+        restartEnvironment: { ...process.env },
+        sealed,
+      });
+
+      const restart = mocks.restartService.mock.calls.at(-1)?.[0];
+      expect({ port: restart?.gatewayPort, refresh: restart?.refreshServiceEnv }).toEqual({
+        port: expected,
+        refresh: !sealed,
+      });
+      if (!sealed) {
+        expect(mocks.prepareRestartScript).toHaveBeenCalledWith(
+          serviceEnv,
+          expected,
+          expect.any(Array),
+        );
+        expect(mocks.createServiceConfigIO).not.toHaveBeenCalled();
+      }
+    });
+
+    it.each(["inspection", "revalidation"] as const)(
+      "does not restart a stopped sealed service when fresh %s fails",
+      async (failure) => {
+        const error = new Error("inspection-secret-canary");
+        mocks.readServiceState.mockResolvedValue({
+          installed: true,
+          loadState: { status: "loaded" },
+          env: {},
+          command: {
+            programArguments: ["/usr/bin/node", "/tmp/openclaw-update/dist/index.js", "gateway"],
+          },
+        });
+        if (failure === "inspection") {
+          mocks.readServiceState.mockRejectedValueOnce(error);
+        } else {
+          mocks.revalidateService.mockRejectedValueOnce(error);
+        }
         await finishSuccessfulPackageSwitch({
           previousRoot: "/tmp/openclaw-update",
           packageRoot: "/tmp/openclaw-update",
           restartEnvironment: { ...process.env },
           sealed: true,
         });
-      } finally {
-        vi.unstubAllEnvs();
-      }
-      expect(mocks.restartService).not.toHaveBeenCalled();
-      expect(mocks.prepareRestartScript).not.toHaveBeenCalled();
-      expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-      expect(defaultRuntime.error).toHaveBeenCalledWith(
-        "Stopped gateway service could not be revalidated; inspect it before restarting manually.",
-      );
-      expect(mocks.printResult).not.toHaveBeenCalled();
-    },
-  );
 
-  it.each([
-    { name: "finalizes only after healthy activation", activated: true, unloaded: false },
-    {
-      name: "marks failed activation without finalizing success",
-      activated: false,
-      unloaded: false,
-    },
-    {
-      name: "preserves the native context of an unloaded git service",
-      activated: true,
-      unloaded: true,
-    },
-  ])("canonical sealed post-update $name", async ({ activated, unloaded }) => {
-    const serviceEnv = { MANAGED_VALUE: "revalidated" };
-    const programArguments = ["/usr/bin/node", "/tmp/openclaw-update/dist/index.js", "gateway"];
-    mocks.readServiceState.mockResolvedValueOnce({
-      installed: true,
-      loadState: { status: unloaded ? "not-loaded" : "loaded" },
-      env: serviceEnv,
-      command: { programArguments, environment: serviceEnv },
-    });
-    mocks.restartService.mockResolvedValueOnce(activated);
-    vi.stubEnv("HOME", os.homedir());
-    vi.stubEnv("OPENCLAW_PROFILE", "default");
-    for (const key of ["OPENCLAW_HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"]) {
-      vi.stubEnv(key, "");
-    }
-    try {
+        expect(mocks.restartService).not.toHaveBeenCalled();
+        expect(mocks.prepareRestartScript).not.toHaveBeenCalled();
+        expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+        expect(defaultRuntime.error).toHaveBeenCalledWith(
+          "Stopped gateway service could not be revalidated; inspect it before restarting manually.",
+        );
+        expect(mocks.printResult).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      { name: "finalizes only after healthy activation", activated: true, unloaded: false },
+      {
+        name: "marks failed activation without finalizing success",
+        activated: false,
+        unloaded: false,
+      },
+      {
+        name: "preserves the native context of an unloaded git service",
+        activated: true,
+        unloaded: true,
+      },
+    ])("canonical sealed post-update $name", async ({ activated, unloaded }) => {
+      const serviceEnv = { MANAGED_VALUE: "revalidated" };
+      const programArguments = ["/usr/bin/node", "/tmp/openclaw-update/dist/index.js", "gateway"];
+      mocks.readServiceState.mockResolvedValueOnce({
+        installed: true,
+        loadState: { status: unloaded ? "not-loaded" : "loaded" },
+        env: serviceEnv,
+        command: { programArguments, environment: serviceEnv },
+      });
+      mocks.restartService.mockResolvedValueOnce(activated);
       await finishSuccessfulPackageSwitch({
         previousRoot: "/tmp/openclaw-update",
         packageRoot: "/tmp/openclaw-update",
@@ -709,46 +683,44 @@ describe("successful update finalization ordering", () => {
         updateMode: unloaded ? "git" : "npm",
         stoppedForUpdate: !unloaded,
       });
-    } finally {
-      vi.unstubAllEnvs();
-    }
 
-    expect(mocks.revalidateService).toHaveBeenCalledOnce();
-    expect(mocks.prepareRestartScript).not.toHaveBeenCalled();
-    expect(mocks.restartService).toHaveBeenCalledWith(
-      expect.objectContaining({
-        refreshServiceEnv: false,
-        serviceEnv,
-        serviceUpdateVerdict: {
-          kind: "owned",
-          root: "/tmp/openclaw-update",
-          refreshDefinition: false,
-          fingerprint: "sealed",
-        },
-        channel: unloaded ? "dev" : "stable",
-        result: expect.objectContaining({
-          after: { version: "2026.4.24", ...(unloaded ? { buildId: "new-build" } : {}) },
+      expect(mocks.revalidateService).toHaveBeenCalledOnce();
+      expect(mocks.prepareRestartScript).not.toHaveBeenCalled();
+      expect(mocks.restartService).toHaveBeenCalledWith(
+        expect.objectContaining({
+          refreshServiceEnv: false,
+          serviceEnv,
+          serviceUpdateVerdict: {
+            kind: "owned",
+            root: "/tmp/openclaw-update",
+            refreshDefinition: false,
+            fingerprint: "sealed",
+          },
+          channel: unloaded ? "dev" : "stable",
+          result: expect.objectContaining({
+            after: { version: "2026.4.24", ...(unloaded ? { buildId: "new-build" } : {}) },
+          }),
+          requireRunningServiceAfterRestart: !unloaded,
         }),
-        requireRunningServiceAfterRestart: !unloaded,
-      }),
-    );
-    expect(mocks.revalidateService.mock.invocationCallOrder[0]).toBeLessThan(
-      mocks.restartService.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
-    );
-    if (activated) {
-      expect(mocks.writeSentinel).toHaveBeenCalledTimes(2);
-      expect(mocks.restartService.mock.invocationCallOrder[0]).toBeLessThan(
-        mocks.writeSentinel.mock.invocationCallOrder[1] ?? Number.POSITIVE_INFINITY,
       );
-      expect(mocks.markSentinelFailure).not.toHaveBeenCalled();
-    } else {
-      expect(mocks.writeSentinel).toHaveBeenCalledOnce();
-      expect(mocks.markSentinelFailure).toHaveBeenCalledWith(
-        expect.objectContaining({ reason: "restart-unhealthy" }),
+      expect(mocks.revalidateService.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.restartService.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
       );
-      expect(mocks.printResult).not.toHaveBeenCalled();
-      expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
-    }
+      if (activated) {
+        expect(mocks.writeSentinel).toHaveBeenCalledTimes(2);
+        expect(mocks.restartService.mock.invocationCallOrder[0]).toBeLessThan(
+          mocks.writeSentinel.mock.invocationCallOrder[1] ?? Number.POSITIVE_INFINITY,
+        );
+        expect(mocks.markSentinelFailure).not.toHaveBeenCalled();
+      } else {
+        expect(mocks.writeSentinel).toHaveBeenCalledOnce();
+        expect(mocks.markSentinelFailure).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: "restart-unhealthy" }),
+        );
+        expect(mocks.printResult).not.toHaveBeenCalled();
+        expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+      }
+    });
   });
 });
 

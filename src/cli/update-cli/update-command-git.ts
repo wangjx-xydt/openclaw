@@ -31,7 +31,11 @@ import {
   runUpdateStep,
   type UpdateCommandOptions,
 } from "./shared.js";
-import { UpdateCommandAbort, type PreManagedServiceStop } from "./update-command-service.js";
+import {
+  resolvePreparedGatewayUpdatePolicy,
+  UpdateCommandAbort,
+  type PreManagedServiceStop,
+} from "./update-command-service.js";
 
 const DEFAULT_UPDATE_STEP_TIMEOUT_MS = 30 * 60_000;
 
@@ -186,16 +190,7 @@ export function createBeforeGitMutation(params: {
       defaultRuntime.error(formatSchemaRefusalLines(postStopSchemas).join("\n"));
       throw new UpdateCommandAbort();
     }
-    return {
-      // Root ownership permits activation; rewriting also requires definition authority.
-      allowGatewayServiceRepair:
-        preManagedServiceStop?.serviceUpdateVerdict?.kind === "owned" &&
-        preManagedServiceStop.serviceUpdateVerdict.refreshDefinition,
-      allowGatewayActivation:
-        params.shouldRestart &&
-        preManagedServiceStop?.stopped === true &&
-        preManagedServiceStop.serviceMatchesMutationRoot === true,
-    };
+    return resolvePreparedGatewayUpdatePolicy(preManagedServiceStop, params.shouldRestart);
   };
 }
 

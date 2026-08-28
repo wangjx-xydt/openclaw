@@ -105,7 +105,7 @@ export async function maybeOfferUpdateBeforeDoctor(params: {
           inspection?.serviceUpdateVerdict?.kind === "owned" &&
           inspection.serviceUpdateVerdict.refreshDefinition,
         allowGatewayActivation: Boolean(
-          inspection?.running && inspection.serviceMatchesMutationRoot,
+          inspection?.running && inspection.serviceUpdateVerdict?.kind === "owned",
         ),
         beforeGitMutation: serviceLifecycle
           ? async () => {
@@ -126,13 +126,8 @@ export async function maybeOfferUpdateBeforeDoctor(params: {
               ) {
                 note(inspection.serviceMutationSkipMessage, "Update");
               }
-              const verdict = inspection.serviceUpdateVerdict;
               gitMutationAuthorized = true;
-              return {
-                allowGatewayServiceRepair: verdict?.kind === "owned" && verdict.refreshDefinition,
-                allowGatewayActivation:
-                  inspection.stopped && inspection.serviceMatchesMutationRoot === true,
-              };
+              return serviceLifecycle.resolvePreparedGatewayUpdatePolicy(inspection, true);
             }
           : undefined,
       });

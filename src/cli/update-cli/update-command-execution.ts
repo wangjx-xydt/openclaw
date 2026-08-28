@@ -24,6 +24,7 @@ import {
   maybeRestartServiceAfterFailedMutableUpdate,
   maybeResumeWindowsTaskAutoStartAfterPackageUpdate,
   maybeStopManagedServiceBeforeMutableUpdate,
+  resolvePreparedGatewayUpdatePolicy,
   shouldBlockMutableUpdateFromGatewayServiceEnv,
   UpdateCommandAbort,
   type ManagedServiceRootRedirect,
@@ -208,13 +209,7 @@ export async function executeMutableUpdate(params: {
               startedAt: params.startedAt,
               progress: params.progress,
               jsonMode: Boolean(params.opts.json),
-              allowGatewayServiceRepair:
-                preManagedServiceStop?.serviceUpdateVerdict?.kind === "owned" &&
-                preManagedServiceStop.serviceUpdateVerdict.refreshDefinition,
-              allowGatewayActivation:
-                params.shouldRestart &&
-                preManagedServiceStop?.stopped === true &&
-                preManagedServiceStop.serviceMatchesMutationRoot === true,
+              ...resolvePreparedGatewayUpdatePolicy(preManagedServiceStop, params.shouldRestart),
               managedServiceEnv: preManagedServiceStop?.serviceEnv,
               invocationCwd: params.invocationCwd,
               honorPackageRoot:

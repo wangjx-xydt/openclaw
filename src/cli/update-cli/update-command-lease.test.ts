@@ -4,11 +4,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { readConfigFileSnapshot } from "../../config/config.js";
+import type { PluginInstallRecord } from "../../config/types.plugins.js";
 import {
   loadInstalledPluginIndexInstallRecords,
   writePersistedInstalledPluginIndexInstallRecords,
 } from "../../plugins/installed-plugin-index-records.js";
-import { withPluginLifecycleLease } from "../../plugins/plugin-lifecycle-lease.js";
 import { runExec } from "../../process/exec.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
@@ -19,7 +19,6 @@ import {
 const mocks = vi.hoisted(() => ({
   entrypoint: vi.fn(),
   root: vi.fn(),
-  doctor: vi.fn(),
   plugins: vi.fn<typeof import("./update-command-plugins.js").updatePluginsAfterCoreUpdate>(),
   restart: vi.fn(async () => true),
   print: vi.fn(),
@@ -28,7 +27,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../daemon/gateway-entrypoint.js", () => ({
   resolveGatewayInstallEntrypoint: mocks.entrypoint,
 }));
-vi.mock("../../commands/doctor.js", () => ({ doctorCommand: mocks.doctor }));
 vi.mock("./update-command-plugins.js", () => ({ updatePluginsAfterCoreUpdate: mocks.plugins }));
 vi.mock("./progress.js", () => ({ printResult: mocks.print }));
 vi.mock("./shared.js", async (importOriginal) => ({
@@ -43,6 +41,7 @@ vi.mock("./update-command-service.js", async (importOriginal) => ({
 }));
 
 import { updateFinalizeCommand } from "./update-command-finalize.js";
+import type { LeaseScenario } from "./update-command-lease.test-support.js";
 import type { PostCorePluginUpdateResult } from "./update-command-plugins.js";
 import { finishUpdate } from "./update-command-post-update.js";
 import { resumePostCoreUpdate } from "./update-command-resume.js";
@@ -54,7 +53,7 @@ const pluginResult: PostCorePluginUpdateResult = {
   npm: { changed: false, outcomes: [] },
   integrityDrifts: [],
 };
-type Lane = "resume" | "current-process" | "repair";
+type Lane = LeaseScenario["lane"];
 let state: OpenClawTestState;
 let entrypoint: string;
 
@@ -72,7 +71,6 @@ beforeEach(async () => {
     },
   });
   await state.writeConfig({ plugins: { enabled: false }, update: { channel: "stable" } });
-  await state.writeJson("scenario.json", {});
   await fs.writeFile(state.path("package.json"), JSON.stringify({ version: "1.0.0" }));
   entrypoint = await state.writeText(
     "entry.mjs",
@@ -84,9 +82,7 @@ beforeEach(async () => {
   );
   mocks.entrypoint.mockResolvedValue(entrypoint);
   mocks.root.mockResolvedValue(state.root);
-  mocks.plugins.mockResolvedValue(pluginResult);
-  // The repair path's in-process doctor retains real same-process reentrancy.
-  mocks.doctor.mockImplementation(async () => withPluginLifecycleLease({}, async () => undefined));
+  mocks.plugins.mockReset().mockResolvedValue(pluginResult);
   vi.spyOn(defaultRuntime, "exit").mockImplementation(() => undefined as never);
   vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => undefined);
   vi.spyOn(defaultRuntime, "log").mockImplementation(() => undefined);
@@ -98,6 +94,13 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await state.cleanup();
 });
+
+async function writeScenario(
+  lane: Lane,
+  scenario: Omit<LeaseScenario, "lane"> = {},
+): Promise<void> {
+  await state.writeJson("scenario.json", { ...scenario, lane });
+}
 
 async function invoke(lane: Lane): Promise<void> {
   if (lane === "resume") {
@@ -156,6 +159,14 @@ async function events(): Promise<string[]> {
     });
 }
 
+function expectDoctorDiagnostics(): void {
+  expect(defaultRuntime.log).not.toHaveBeenCalledWith(expect.stringContaining("doctor fixture"));
+  expect(defaultRuntime.error).toHaveBeenCalledWith("doctor fixture output");
+  expect(defaultRuntime.error).toHaveBeenCalledWith(
+    expect.stringContaining("doctor fixture diagnostic"),
+  );
+}
+
 function expectSuccess(lane: Lane): void {
   expect(defaultRuntime.exit).not.toHaveBeenCalledWith(1);
   const output =
@@ -163,21 +174,20 @@ function expectSuccess(lane: Lane): void {
       ? mocks.print.mock.lastCall?.[0]
       : vi.mocked(defaultRuntime.writeJson).mock.lastCall?.[0];
   expect(output).toMatchObject({ status: "ok", postUpdate: { plugins: { status: "ok" } } });
-  expect(defaultRuntime.log).not.toHaveBeenCalledWith(expect.stringContaining("doctor fixture"));
-  expect(defaultRuntime.error).not.toHaveBeenCalledWith(expect.stringContaining("doctor fixture"));
+  expectDoctorDiagnostics();
 }
 
 describe("update orchestration lifecycle ownership", () => {
   it.each(["resume", "current-process", "repair"] as const)(
     "%s releases ownership for fresh doctor and strict validation",
     async (lane) => {
-      await state.writeJson("scenario.json", {
+      await writeScenario(lane, {
         hostVersion: lane === "repair" ? undefined : "1.0.0",
       });
       await invoke(lane);
       expectSuccess(lane);
       expect(await events()).toEqual([
-        ...(lane === "resume" ? ["pre-attempt", "pre-acquired"] : []),
+        ...(lane === "current-process" ? [] : ["pre-attempt", "pre-acquired"]),
         "post-attempt",
         "post-acquired",
         "validate",
@@ -194,6 +204,7 @@ describe("update orchestration lifecycle ownership", () => {
   it.each(["resume", "current-process", "repair"] as const)(
     "%s keeps plugin mutation exclusive to its parent",
     async (lane) => {
+      await writeScenario(lane);
       mocks.plugins.mockImplementationOnce(async () => {
         const result = await runExec(process.execPath, [entrypoint, "probe"], {
           timeoutMs: 15_000,
@@ -214,8 +225,10 @@ describe("update orchestration lifecycle ownership", () => {
     async (lane) => {
       await writePersistedInstalledPluginIndexInstallRecords({ old: { source: "path" } });
       expect(await loadInstalledPluginIndexInstallRecords()).toHaveProperty("old");
-      const writerRecords = { current: { source: "path", sourcePath: state.path("current") } };
-      await state.writeJson("scenario.json", {
+      const writerRecords: Record<string, PluginInstallRecord> = {
+        current: { source: "path", sourcePath: state.path("current") },
+      };
+      await writeScenario(lane, {
         writerConfig: {
           plugins: { enabled: false },
           update: { channel: "beta" },
@@ -287,8 +300,10 @@ describe("update orchestration lifecycle ownership", () => {
       const recordsPath = await state.writeJson("forwarded.json", old);
       vi.stubEnv("OPENCLAW_UPDATE_POST_CORE_INSTALL_RECORDS_PATH", recordsPath);
       vi.stubEnv("OPENCLAW_UPDATE_POST_CORE_STARTED_AT_MS", String(Date.now()));
-      const current = empty ? {} : { current: { source: "path" } };
-      await state.writeJson("scenario.json", {
+      const current: Record<string, PluginInstallRecord> = empty
+        ? {}
+        : { current: { source: "path" } };
+      await writeScenario("resume", {
         doctorWrites: true,
         writerConfig: { plugins: { enabled: false }, gateway: { port: 19003 } },
         writerRecords: current,
@@ -317,23 +332,18 @@ describe("update orchestration lifecycle ownership", () => {
   it.each(["resume", "repair"] as const)(
     "%s does not run a final doctor when no plugins changed",
     async (lane) => {
+      await writeScenario(lane);
       mocks.plugins.mockResolvedValueOnce({ ...pluginResult, changed: false });
       await invoke(lane);
       expectSuccess(lane);
-      if (lane === "resume") {
-        expect(await events()).toEqual(["pre-attempt", "pre-acquired"]);
-      } else {
-        await expect(fs.access(state.statePath("events.jsonl"))).rejects.toMatchObject({
-          code: "ENOENT",
-        });
-      }
+      expect(await events()).toEqual(["pre-attempt", "pre-acquired"]);
     },
   );
 
   it.each(["resume", "current-process", "repair"] as const)(
     "%s retains strict fresh validation after releasing the lease",
     async (lane) => {
-      await state.writeJson("scenario.json", { invalidConfig: true });
+      await writeScenario(lane, { invalidConfig: true });
       await invoke(lane);
       const output =
         lane === "current-process"
@@ -352,14 +362,8 @@ describe("update orchestration lifecycle ownership", () => {
     },
   );
 
-  it("repair persists a requested channel before its in-process doctor and retains timings", async () => {
-    mocks.doctor.mockImplementationOnce(async () =>
-      withPluginLifecycleLease({}, async () => {
-        expect((await readConfigFileSnapshot()).config.update?.channel).toBe("beta");
-        const probe = await runExec(process.execPath, [entrypoint, "probe"], { timeoutMs: 15_000 });
-        expect(probe.stdout).toBe("excluded");
-      }),
-    );
+  it("repair persists a requested channel before its fresh doctor and retains timings", async () => {
+    await writeScenario("repair", { preDoctorChannel: "beta" });
     await updateFinalizeCommand({
       channel: "beta",
       json: true,
@@ -368,6 +372,7 @@ describe("update orchestration lifecycle ownership", () => {
       deferCompletionCache: true,
     });
     expectSuccess("repair");
+    expect(await events()).toContain("pre-acquired");
     expect(vi.mocked(defaultRuntime.writeJson).mock.lastCall?.[0]).toMatchObject({
       channel: "beta",
       restart: false,
@@ -387,16 +392,20 @@ describe("update orchestration lifecycle ownership", () => {
     });
   });
 
-  it("propagates a pre-plugin doctor failure before parent mutation", async () => {
-    await state.writeJson("scenario.json", { failDoctor: "pre" });
-    await expect(invoke("resume")).rejects.toThrow("doctor fixture failure");
-    expect(mocks.plugins).not.toHaveBeenCalled();
-    expect(defaultRuntime.writeJson).not.toHaveBeenCalled();
-    expect(await events()).toEqual(["pre-attempt", "pre-acquired"]);
-  });
+  it.each(["resume", "repair"] as const)(
+    "%s propagates a pre-plugin doctor failure before parent mutation",
+    async (lane) => {
+      await writeScenario(lane, { failDoctor: "pre" });
+      await expect(invoke(lane)).rejects.toThrow("doctor fixture failure");
+      expect(mocks.plugins).not.toHaveBeenCalled();
+      expect(defaultRuntime.writeJson).not.toHaveBeenCalled();
+      expectDoctorDiagnostics();
+      expect(await events()).toEqual(["pre-attempt", "pre-acquired"]);
+    },
+  );
 
   it("keeps a failed final doctor fatal even when strict validation succeeds", async () => {
-    await state.writeJson("scenario.json", { failDoctor: "post", hostVersion: "1.0.0" });
+    await writeScenario("current-process", { failDoctor: "post", hostVersion: "1.0.0" });
     await invoke("current-process");
     expect(mocks.print.mock.lastCall?.[0]).toMatchObject({
       status: "error",
@@ -405,6 +414,7 @@ describe("update orchestration lifecycle ownership", () => {
     expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
     expect(mocks.restart).not.toHaveBeenCalled();
     expect(process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION).toBeUndefined();
+    expectDoctorDiagnostics();
     expect(await events()).toEqual(["post-attempt", "post-acquired", "validate"]);
   });
 });

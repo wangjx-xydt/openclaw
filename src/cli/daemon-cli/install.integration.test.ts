@@ -3,6 +3,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildServiceEnvironment } from "../../daemon/service-env.js";
+import {
+  buildSystemdManagerPropertyOutput,
+  buildSystemdUnitPropertyOutput,
+} from "../../daemon/service.test-helpers.js";
 import { makeTempWorkspace } from "../../test-helpers/workspace.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { createCliRuntimeCapture } from "../test-runtime-capture.js";
@@ -94,6 +98,12 @@ describe("runDaemonInstall integration", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
   let tempHome: string;
   let configPath: string;
+
+  async function snapshotConfig() {
+    const contents = await fs.readFile(configPath);
+    const { ino, mode, uid } = await fs.lstat(configPath);
+    return { contents, ino, mode, uid, entries: (await fs.readdir(tempHome)).toSorted() };
+  }
 
   beforeAll(async () => {
     envSnapshot = captureEnv([
@@ -188,30 +198,14 @@ describe("runDaemonInstall integration", () => {
         code: 0,
         termination: "exit",
         stderr: "",
-        stdout: (args.includes("LoadUnit")
-          ? [{ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] }]
+        stdout: args.includes("LoadUnit")
+          ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] })
           : args.includes("org.freedesktop.systemd1.Unit")
-            ? [
-                { type: "s", data: kind === "fragment" ? extra : unitPath },
-                { type: "as", data: kind === "fragment" ? [] : [extra] },
-                { type: "b", data: false },
-                { type: "s", data: "loaded" },
-              ]
-            : [
-                {
-                  type: "a(sasbttttuii)",
-                  data: [
-                    ["/usr/bin/node", ["/usr/bin/node", "gateway"], false, 0, 0, 0, 0, 0, 0, 0],
-                  ],
-                },
-                { type: "s", data: "" },
-                { type: "as", data: [] },
-                { type: "a(sb)", data: [] },
-                { type: "as", data: [] },
-              ]
-        )
-          .map((property) => JSON.stringify(property))
-          .join("\n"),
+            ? buildSystemdUnitPropertyOutput({
+                fragmentPath: kind === "fragment" ? extra : unitPath,
+                dropInPaths: kind === "fragment" ? [] : [extra],
+              })
+            : buildSystemdManagerPropertyOutput({ programArguments: ["/usr/bin/node", "gateway"] }),
       }));
       const env = { ...process.env, HOME: fixture, OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway" };
       serviceMock.readCommand.mockImplementationOnce((_env, options) =>
@@ -220,15 +214,11 @@ describe("runDaemonInstall integration", () => {
       serviceMock.readDefinitionMutationCapability.mockImplementationOnce(() =>
         readSystemdDefinitionMutationCapability(env),
       );
-      const before = await fs.readFile(configPath);
-      const identity = await fs.lstat(configPath);
-      const entries = await fs.readdir(tempHome);
+      const before = await snapshotConfig();
       const managedEntries = await fs.readdir(path.dirname(unitPath));
       try {
         await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
-        expect(await fs.readFile(configPath)).toEqual(before);
-        expect((await fs.lstat(configPath)).ino).toBe(identity.ino);
-        expect(await fs.readdir(tempHome)).toEqual(entries);
+        expect(await snapshotConfig()).toEqual(before);
         expect(await fs.readdir(path.dirname(unitPath))).toEqual(managedEntries);
         expect(await fs.readFile(extra, "utf8")).toContain("operator-secret-canary");
         expect(serviceMock.install).not.toHaveBeenCalled();
@@ -282,28 +272,15 @@ describe("runDaemonInstall integration", () => {
       code: 0,
       termination: "exit",
       stderr: "",
-      stdout: (args.includes("LoadUnit")
-        ? [{ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] }]
+      stdout: args.includes("LoadUnit")
+        ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] })
         : args.includes("org.freedesktop.systemd1.Unit")
-          ? [
-              { type: "s", data: unit },
-              { type: "as", data: [dropIn] },
-              { type: "b", data: false },
-              { type: "s", data: "loaded" },
-            ]
-          : [
-              {
-                type: "a(sasbttttuii)",
-                data: [["/usr/bin/node", ["/usr/bin/node", "gateway"], false, 0, 0, 0, 0, 0, 0, 0]],
-              },
-              { type: "s", data: "" },
-              { type: "as", data: [`OPENCLAW_STATE_DIR=${effectiveState}`] },
-              { type: "a(sb)", data: [[effectiveFile, false]] },
-              { type: "as", data: [] },
-            ]
-      )
-        .map((property) => JSON.stringify(property))
-        .join("\n"),
+          ? buildSystemdUnitPropertyOutput({ fragmentPath: unit, dropInPaths: [dropIn] })
+          : buildSystemdManagerPropertyOutput({
+              programArguments: ["/usr/bin/node", "gateway"],
+              environment: [`OPENCLAW_STATE_DIR=${effectiveState}`],
+              environmentFiles: [[effectiveFile, false]],
+            }),
     }));
     serviceMock.readCommand.mockImplementation(readSystemdServiceExecStart);
     serviceMock.readDefinitionMutationCapability.mockImplementation((args) =>
@@ -319,12 +296,10 @@ describe("runDaemonInstall integration", () => {
         }),
       );
     });
-    const before = await fs.readFile(configPath);
-    const identity = await fs.lstat(configPath);
+    const before = await snapshotConfig();
     try {
       await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
-      expect(await fs.readFile(configPath)).toEqual(before);
-      expect((await fs.lstat(configPath)).ino).toBe(identity.ino);
+      expect(await snapshotConfig()).toEqual(before);
       expect(serviceMock.install).not.toHaveBeenCalled();
       expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
       expect(await fs.readdir(plannedState)).toEqual(["gateway.systemd.env"]);
@@ -390,24 +365,11 @@ describe("runDaemonInstall integration", () => {
       await fs.writeFile(configPath, JSON.stringify(config, null, 2));
       clearConfigCache();
       serviceMock.readDefinitionMutationCapability.mockResolvedValueOnce(capability as never);
-      const originalBytes = await fs.readFile(configPath);
-      const originalIdentity = await fs.lstat(configPath);
-      const originalEntries = (await fs.readdir(tempHome)).toSorted();
+      const before = await snapshotConfig();
 
       await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
 
-      const actualIdentity = await fs.lstat(configPath);
-      expect(await fs.readFile(configPath)).toEqual(originalBytes);
-      expect((await fs.readdir(tempHome)).toSorted()).toEqual(originalEntries);
-      expect({
-        ino: actualIdentity.ino,
-        mode: actualIdentity.mode,
-        uid: actualIdentity.uid,
-      }).toEqual({
-        ino: originalIdentity.ino,
-        mode: originalIdentity.mode,
-        uid: originalIdentity.uid,
-      });
+      expect(await snapshotConfig()).toEqual(before);
       expect(serviceMock.install).not.toHaveBeenCalled();
       expect(serviceMock.readCommand).toHaveBeenCalledOnce();
       expect(runtimeLogs.join("\n")).toContain(marker);
@@ -429,15 +391,11 @@ describe("runDaemonInstall integration", () => {
       clearConfigCache();
       serviceMock.isLoaded.mockResolvedValue(loaded);
       serviceMock.readCommand.mockRejectedValueOnce(new Error(secret));
-      const originalBytes = await fs.readFile(configPath);
-      const originalIdentity = await fs.lstat(configPath);
-      const originalEntries = (await fs.readdir(tempHome)).toSorted();
+      const before = await snapshotConfig();
 
       await expect(runDaemonInstall({ json: true, force })).rejects.toThrow("__exit__:1");
 
-      expect(await fs.readFile(configPath)).toEqual(originalBytes);
-      expect((await fs.lstat(configPath)).ino).toBe(originalIdentity.ino);
-      expect((await fs.readdir(tempHome)).toSorted()).toEqual(originalEntries);
+      expect(await snapshotConfig()).toEqual(before);
       expect(serviceMock.readCommand).toHaveBeenCalledWith(expect.any(Object), {
         requireEffective: true,
       });
@@ -456,16 +414,14 @@ describe("runDaemonInstall integration", () => {
     clearConfigCache();
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readCommand.mockResolvedValue(await createInstalledServiceCommand());
-    const originalBytes = await fs.readFile(configPath);
-    const originalEntries = (await fs.readdir(tempHome)).toSorted();
+    const before = await snapshotConfig();
 
     await runDaemonInstall({ json: true });
 
     expect(runtimeLogs.join("\n")).toContain('"result": "already-installed"');
     expect(serviceMock.readDefinitionMutationCapability).not.toHaveBeenCalled();
     expect(serviceMock.install).not.toHaveBeenCalled();
-    expect(await fs.readFile(configPath)).toEqual(originalBytes);
-    expect((await fs.readdir(tempHome)).toSorted()).toEqual(originalEntries);
+    expect(await snapshotConfig()).toEqual(before);
   });
 
   it("repairs missing gateway mode for a loaded sealed service without rewriting its definition", async () => {
@@ -502,15 +458,13 @@ describe("runDaemonInstall integration", () => {
       kind: "sealed",
       detail: "unit definition is owned by root",
     } as never);
-    const originalBytes = await fs.readFile(configPath);
-    const originalEntries = (await fs.readdir(tempHome)).toSorted();
+    const before = await snapshotConfig();
 
     await expect(runDaemonInstall({ json: true })).rejects.toThrow("__exit__:1");
 
     expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
     expect(serviceMock.install).not.toHaveBeenCalled();
-    expect(await fs.readFile(configPath)).toEqual(originalBytes);
-    expect((await fs.readdir(tempHome)).toSorted()).toEqual(originalEntries);
+    expect(await snapshotConfig()).toEqual(before);
   });
 
   it("refuses a loaded service's sealed effective state before persisting config or a token", async () => {
@@ -528,8 +482,7 @@ describe("runDaemonInstall integration", () => {
           ? { kind: "sealed", detail: "effective state is owned by root" }
           : { kind: "writable" }) as never,
     );
-    const originalBytes = await fs.readFile(configPath);
-    const originalEntries = (await fs.readdir(tempHome)).toSorted();
+    const before = await snapshotConfig();
 
     await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
 
@@ -539,8 +492,7 @@ describe("runDaemonInstall integration", () => {
         environment: expect.objectContaining({ OPENCLAW_STATE_DIR: effectiveStateDir }),
       }),
     );
-    expect(await fs.readFile(configPath)).toEqual(originalBytes);
-    expect((await fs.readdir(tempHome)).toSorted()).toEqual(originalEntries);
+    expect(await snapshotConfig()).toEqual(before);
     expect(serviceMock.install).not.toHaveBeenCalled();
     expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
   });

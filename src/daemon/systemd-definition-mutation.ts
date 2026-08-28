@@ -19,7 +19,7 @@ import {
   resolveSystemdEnvironmentFilePath,
   resolveSystemdUnitPath,
 } from "./systemd-service-files.js";
-import { assertNoSystemSystemdOwnership } from "./systemd-system.js";
+import { assertNoSystemSystemdOwnership, isSystemSystemdOwnershipError } from "./systemd-system.js";
 
 type Snapshot = { contents: Buffer; mode: number } | null;
 type SystemdDefinitionMutation = {
@@ -187,9 +187,11 @@ export async function readSystemdDefinitionMutationCapability(
         deadlineAt === undefined ? undefined : Math.max(1, deadlineAt - Date.now()),
       );
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "";
       return {
-        kind: detail.includes("already owns") ? "sealed" : "unknown",
+        kind:
+          isSystemSystemdOwnershipError(error) && error.ownership.status !== "unverifiable"
+            ? "sealed"
+            : "unknown",
         detail: `System service ${name} requires its privileged deployment owner.`,
       };
     }

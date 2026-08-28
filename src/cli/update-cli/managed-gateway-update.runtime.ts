@@ -1,5 +1,6 @@
 export {
   maybeRestartService,
+  resolvePreparedGatewayUpdatePolicy,
   resolveUpdatedGatewayRestartPort,
   maybeRestartServiceAfterFailedMutableUpdate,
   maybeStopManagedServiceBeforeMutableUpdate,

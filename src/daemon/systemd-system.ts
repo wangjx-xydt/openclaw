@@ -4,7 +4,7 @@ import path from "node:path";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import { isMissingPathError } from "../infra/errors.js";
-import { execFileUtf8 } from "./exec-file.js";
+import { execSystemctl, readSystemctlDetail } from "./systemd-exec.js";
 
 type SystemSystemdOwnership =
   | { status: "absent"; unitName: string }
@@ -28,8 +28,6 @@ function quotePosixArgument(value: string): string {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-const runSystemctl = (args: string[]) => execFileUtf8("systemctl", args);
-
 function unverifiableSystemOwnership(
   unitName: string,
   detail: string,
@@ -40,7 +38,7 @@ function unverifiableSystemOwnership(
 
 async function querySystemManager(
   unitName: string,
-  run = runSystemctl,
+  run = execSystemctl,
 ): Promise<SystemSystemdOwnership> {
   const result = await run(["show", "--property=LoadState", "--value", unitName]);
   const loadState = result.stdout.trim().toLowerCase();
@@ -53,8 +51,7 @@ async function querySystemManager(
     }
     return unverifiableSystemOwnership(unitName, "systemctl returned no LoadState");
   }
-  const detail =
-    `${result.stderr} ${result.stdout}`.trim() || `systemctl exited with code ${result.code}`;
+  const detail = readSystemctlDetail(result) || `systemctl exited with code ${result.code}`;
   const normalizedDetail = detail.toLowerCase();
   if (
     result.termination === "exit" &&
@@ -68,12 +65,11 @@ async function querySystemManager(
 
 async function findInstalledSystemUnit(
   unitName: string,
-  run = runSystemctl,
+  run = execSystemctl,
 ): Promise<SystemSystemdOwnership> {
   const result = await run(["show", "--property=UnitPath", "--value"]);
   if (result.code !== 0) {
-    const detail =
-      `${result.stderr} ${result.stdout}`.trim() || `systemctl exited with code ${result.code}`;
+    const detail = readSystemctlDetail(result) || `systemctl exited with code ${result.code}`;
     return unverifiableSystemOwnership(unitName, detail);
   }
   const loadPaths = [...new Set(result.stdout.split(/\s+/).filter(path.posix.isAbsolute))];
@@ -108,13 +104,8 @@ async function inspectSystemSystemdOwnership(
   }
 
   const deadlineAt = timeoutMs && timeoutMs > 0 ? Date.now() + timeoutMs : undefined;
-  const run = deadlineAt
-    ? (args: string[]) =>
-        execFileUtf8("systemctl", args, {
-          timeout: Math.max(1, deadlineAt - Date.now()),
-          killSignal: "SIGKILL",
-        })
-    : runSystemctl;
+  const run = (args: string[]) =>
+    execSystemctl(args, undefined, deadlineAt ? Math.max(1, deadlineAt - Date.now()) : undefined);
   const initialQuery = await querySystemManager(unitName, run);
   if (initialQuery.status !== "absent") {
     return initialQuery;
@@ -175,6 +166,12 @@ class SystemSystemdOwnershipError extends Error {
     super(formatSystemSystemdOwnershipError(ownership));
     this.name = "SystemSystemdOwnershipError";
   }
+}
+
+export function isSystemSystemdOwnershipError(
+  error: unknown,
+): error is SystemSystemdOwnershipError {
+  return error instanceof SystemSystemdOwnershipError;
 }
 
 export async function assertNoSystemSystemdOwnership(

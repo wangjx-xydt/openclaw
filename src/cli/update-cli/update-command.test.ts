@@ -109,17 +109,6 @@ describe("shouldPrepareUpdatedInstallRestart", () => {
     ).toBe(false);
   });
 
-  it("does not prepare package restart for a service owned by another root", () => {
-    expect(
-      shouldPrepareUpdatedInstallRestart({
-        updateMode: "npm",
-        serviceInstalled: true,
-        serviceLoaded: true,
-        serviceMatchesMutationRoot: false,
-      }),
-    ).toBe(false);
-  });
-
   it("keeps non-package updates tied to the matching loaded service state", () => {
     expect(
       shouldPrepareUpdatedInstallRestart({
@@ -691,43 +680,52 @@ describe("formatPostUpdateGatewayRecoveryInstructions", () => {
 });
 
 describe("recoverInstalledLaunchAgentAfterUpdate", () => {
-  it("re-bootstraps an installed-but-not-loaded macOS LaunchAgent after update", async () => {
-    const service = {} as never;
-    const serviceEnv = { OPENCLAW_PROFILE: "stomme" } as NodeJS.ProcessEnv;
-    const recoveredEnv = { ...serviceEnv, OPENCLAW_PORT: "18790" } as NodeJS.ProcessEnv;
-    const readState = vi.fn(async () => ({
-      installed: true,
-      loadState: { status: "not-loaded" },
-      running: false,
-      env: recoveredEnv,
-      command: null,
-      runtime: { status: "unknown", missingSupervision: true },
-    }));
-    const recover = vi.fn(async () => ({
-      result: "restarted" as const,
-      loaded: true as const,
-      message: "Gateway LaunchAgent was installed but not loaded; re-bootstrapped launchd service.",
-    }));
+  it.each(["recovered", "failed", "system owner"] as const)(
+    "reports installed-but-not-loaded LaunchAgent recovery: %s",
+    async (outcome) => {
+      const service = {} as never;
+      const serviceEnv = { OPENCLAW_PROFILE: "stomme" };
+      const recoveredEnv = { ...serviceEnv, OPENCLAW_PORT: "18790" };
+      const readState = vi.fn(async () => ({
+        installed: true,
+        loadState: { status: "not-loaded" },
+        running: false,
+        env: recoveredEnv,
+        command: null,
+        runtime: { status: "unknown", missingSupervision: true },
+      }));
+      const message =
+        "Gateway LaunchAgent was installed but not loaded; re-bootstrapped launchd service.";
+      const guidance = "System LaunchDaemon system/ai.openclaw.stomme owns this label";
+      const recover = vi.fn(async () => {
+        if (outcome === "system owner") {
+          throw new Error(guidance);
+        }
+        return outcome === "recovered" ? { result: "restarted", loaded: true, message } : null;
+      });
 
-    await expect(
-      updateCommandServiceTesting.recoverInstalledLaunchAgentAfterUpdate({
-        service,
-        env: serviceEnv,
-        deps: {
-          platform: "darwin",
-          readState: readState as never,
-          recover: recover as never,
-        },
-      }),
-    ).resolves.toEqual({
-      attempted: true,
-      recovered: true,
-      message: "Gateway LaunchAgent was installed but not loaded; re-bootstrapped launchd service.",
-    });
-
-    expect(readState).toHaveBeenCalledWith(service, { env: serviceEnv });
-    expect(recover).toHaveBeenCalledWith({ result: "restarted", env: recoveredEnv });
-  });
+      await expect(
+        updateCommandServiceTesting.recoverInstalledLaunchAgentAfterUpdate({
+          service,
+          env: serviceEnv,
+          deps: { platform: "darwin", readState: readState as never, recover: recover as never },
+        }),
+      ).resolves.toEqual(
+        outcome === "recovered"
+          ? { attempted: true, recovered: true, message }
+          : {
+              attempted: true,
+              recovered: false,
+              detail:
+                outcome === "system owner"
+                  ? guidance
+                  : "LaunchAgent was installed but not loaded; automatic bootstrap/kickstart recovery failed.",
+            },
+      );
+      expect(readState).toHaveBeenCalledWith(service, { env: serviceEnv });
+      expect(recover).toHaveBeenCalledWith({ result: "restarted", env: recoveredEnv });
+    },
+  );
 
   it("does not touch non-macOS service managers", async () => {
     const readState = vi.fn();
@@ -771,63 +769,6 @@ describe("recoverInstalledLaunchAgentAfterUpdate", () => {
     ).resolves.toEqual({ attempted: false, recovered: false });
 
     expect(recover).not.toHaveBeenCalled();
-  });
-
-  it("returns an explicit failed recovery state when bootstrap repair fails", async () => {
-    const readState = vi.fn(async () => ({
-      installed: true,
-      loadState: { status: "not-loaded" },
-      running: false,
-      env: { OPENCLAW_PROFILE: "stomme" } as NodeJS.ProcessEnv,
-      command: null,
-      runtime: { status: "unknown", missingSupervision: true },
-    }));
-    const recover = vi.fn(async () => null);
-
-    await expect(
-      updateCommandServiceTesting.recoverInstalledLaunchAgentAfterUpdate({
-        service: {} as never,
-        deps: {
-          platform: "darwin",
-          readState: readState as never,
-          recover: recover as never,
-        },
-      }),
-    ).resolves.toEqual({
-      attempted: true,
-      recovered: false,
-      detail:
-        "LaunchAgent was installed but not loaded; automatic bootstrap/kickstart recovery failed.",
-    });
-  });
-
-  it("preserves system LaunchDaemon recovery guidance", async () => {
-    const readState = vi.fn(async () => ({
-      installed: true,
-      loadState: { status: "not-loaded" },
-      running: false,
-      env: { OPENCLAW_PROFILE: "stomme" } as NodeJS.ProcessEnv,
-      command: null,
-      runtime: { status: "unknown", missingSupervision: true },
-    }));
-    const recover = vi.fn(async () => {
-      throw new Error("System LaunchDaemon system/ai.openclaw.stomme owns this label");
-    });
-
-    await expect(
-      updateCommandServiceTesting.recoverInstalledLaunchAgentAfterUpdate({
-        service: {} as never,
-        deps: {
-          platform: "darwin",
-          readState: readState as never,
-          recover: recover as never,
-        },
-      }),
-    ).resolves.toEqual({
-      attempted: true,
-      recovered: false,
-      detail: "System LaunchDaemon system/ai.openclaw.stomme owns this label",
-    });
   });
 });
 

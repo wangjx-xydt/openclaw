@@ -5,7 +5,9 @@ import path from "node:path";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../config/types.plugins.js";
 
-type LeaseScenario = {
+export type LeaseScenario = {
+  lane: "resume" | "current-process" | "repair";
+  preDoctorChannel?: string;
   invalidConfig?: boolean;
   failDoctor?: "pre" | "post";
   hostVersion?: string;
@@ -47,10 +49,11 @@ export async function runUpdateLeaseChild(): Promise<void> {
   }
   const { withPluginLifecycleLease } = await import("../../plugins/plugin-lifecycle-lease.js");
   if (command === "doctor") {
+    const phase = process.env.OPENCLAW_UPDATE_POST_CORE_CONVERGENCE === "1" ? "post" : "pre";
     assert.deepEqual(process.argv.slice(3), [
       "--repair",
       "--non-interactive",
-      "--no-workspace-suggestions",
+      ...(scenario.lane === "repair" && phase === "pre" ? [] : ["--no-workspace-suggestions"]),
       "--yes",
     ]);
     assert.equal(process.env.OPENCLAW_UPDATE_IN_PROGRESS, "1");
@@ -59,11 +62,17 @@ export async function runUpdateLeaseChild(): Promise<void> {
     if (scenario.hostVersion) {
       assert.equal(process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION, scenario.hostVersion);
     }
-    const phase = process.env.OPENCLAW_UPDATE_POST_CORE_CONVERGENCE === "1" ? "post" : "pre";
     await record(`${phase}-attempt`);
     // One real acquisition attempt makes the regression fail promptly, without changing parent budgets.
     await withPluginLifecycleLease({ waitMs: 0 }, async () => {
       await record(`${phase}-acquired`);
+      if (phase === "pre" && scenario.preDoctorChannel !== undefined) {
+        const { readConfigFileSnapshot } = await import("../../config/config.js");
+        assert.equal(
+          (await readConfigFileSnapshot()).config.update?.channel,
+          scenario.preDoctorChannel,
+        );
+      }
       if (phase === "pre" && scenario.doctorWrites) {
         await publish();
       }

@@ -1859,53 +1859,6 @@ describe("update-cli", () => {
     },
   );
 
-  it.each(["git", "npm"] as const)(
-    "activates a stopped canonical sealed %s service through its scope-aware owner",
-    async (mode) => {
-      const serviceEnv = { OPENCLAW_PROFILE: "default", MANAGED_VALUE: "revalidated" };
-      serviceLoaded.mockResolvedValue(true);
-      mockGatewayProbe("2026.4.24", "sealed-gateway");
-      const { maybeRestartService } = await import("./update-cli/update-command-service.js");
-      vi.mocked(resolveGatewayInstallEntrypoint).mockResolvedValue("/updated/dist/index.js");
-
-      await expect(
-        maybeRestartService({
-          channel: "stable",
-          shouldRestart: true,
-          result: makeOkUpdateResult({
-            mode,
-            root: process.cwd(),
-            before: { version: "2026.4.23" },
-            after: { version: "2026.4.24" },
-          }),
-          opts: { json: true },
-          refreshServiceEnv: false,
-          serviceUpdateVerdict: {
-            kind: "owned",
-            root: process.cwd(),
-            refreshDefinition: false,
-            fingerprint: "sealed",
-          },
-          serviceEnv,
-          gatewayPort: 18789,
-          restartScriptPath: "/tmp/legacy-restart-must-not-run.sh",
-          requireRunningServiceAfterRestart: true,
-          timeoutMs: 1_000,
-        }),
-      ).resolves.toBe(true);
-
-      expect(freshRestartCalls().length).toBe(1);
-      const restartOptions = freshRestartCalls()[0]?.[1];
-      expect(typeof restartOptions === "object" && restartOptions.env?.MANAGED_VALUE).toBe(
-        "revalidated",
-      );
-      expect(freshRestartCalls()[0]?.[0]).toContain("--preserve-definition");
-      expect(serviceStart).not.toHaveBeenCalled();
-      expectNoSideEffects(runRestartScript, runDaemonInstall, runDaemonRestart, serviceRestart);
-      expect(probeGateway).toHaveBeenCalled();
-    },
-  );
-
   it("fails sealed-service activation without claiming a successful restart", async () => {
     vi.mocked(runCommandWithTimeout).mockResolvedValueOnce(
       commandResult({ code: 1, stderr: "systemctl restart denied" }),
@@ -1935,63 +1888,6 @@ describe("update-cli", () => {
 
     expect(freshRestartCalls().length).toBe(1);
     expect(serviceStart).not.toHaveBeenCalled();
-    expectNoSideEffects(runRestartScript, runDaemonInstall, runDaemonRestart, serviceRestart);
-  });
-
-  it("retries sealed-service stale-process recovery through the same scope-aware owner", async () => {
-    const staleHealth = {
-      runtime: { status: "stopped", state: "stopped", pid: null },
-      portUsage: {
-        port: 18789,
-        status: "busy",
-        listeners: [{ pid: gatewayFixturePid, command: "openclaw-gateway" }],
-        hints: [],
-      },
-      healthy: false,
-      staleGatewayPids: [gatewayFixturePid],
-      gatewayVersion: "2026.4.24",
-      expectedVersion: "2026.4.24",
-      waitOutcome: "timeout",
-      elapsedMs: 1,
-    };
-    restartHealthTestControl.snapshot = staleHealth;
-    vi.mocked(runCommandWithTimeout).mockImplementation(async () => {
-      if (freshRestartCalls().length === 2) {
-        restartHealthTestControl.snapshot = {
-          ...staleHealth,
-          runtime: { status: "running", state: "running", pid: 4243 },
-          healthy: true,
-          staleGatewayPids: [],
-        };
-      }
-      return commandResult();
-    });
-    const { maybeRestartService } = await import("./update-cli/update-command-service.js");
-    vi.mocked(resolveGatewayInstallEntrypoint).mockResolvedValue("/updated/dist/index.js");
-
-    await expect(
-      maybeRestartService({
-        channel: "stable",
-        shouldRestart: true,
-        result: makeOkUpdateResult({ mode: "npm", after: { version: "2026.4.24" } }),
-        opts: { json: true },
-        refreshServiceEnv: false,
-        serviceUpdateVerdict: {
-          kind: "owned",
-          root: process.cwd(),
-          refreshDefinition: false,
-          fingerprint: "sealed",
-        },
-        serviceEnv: { MANAGED_VALUE: "revalidated" },
-        gatewayPort: 18789,
-        requireRunningServiceAfterRestart: true,
-        timeoutMs: 1_000,
-      }),
-    ).resolves.toBe(true);
-
-    expect(freshRestartCalls().length).toBe(2);
-    expect(serviceStart).not.toHaveBeenCalled();
-    expect(terminateStaleGatewayPids).toHaveBeenCalledWith([gatewayFixturePid]);
     expectNoSideEffects(runRestartScript, runDaemonInstall, runDaemonRestart, serviceRestart);
   });
 
@@ -2848,7 +2744,6 @@ describe("update-cli", () => {
     readPackageVersion.mockResolvedValue("2026.4.14");
     primeNpmChannelTag("latest", "2026.4.10");
     mockCurrentProcessFreshDoctor();
-    mockGatewayProbe("2026.4.10", "downgraded-gateway");
 
     await updateCommand({ yes: true, tag: "2026.4.10", restart: false });
 
@@ -2857,30 +2752,6 @@ describe("update-cli", () => {
     expect(updateNpmInstalledPlugins).toHaveBeenCalledTimes(1);
     expectFreshPostUpdateDoctor({ yes: true });
     expectNoSideEffects(runDaemonInstall, probeGateway);
-    expect(defaultRuntime.exit).not.toHaveBeenCalledWith(1);
-  });
-
-  it("runs the fresh doctor for a core-changing downgrade without plugin changes", async () => {
-    const downgradedRoot = createCaseDir("openclaw-downgraded-fresh-doctor-root");
-    setupUpdatedRootRefresh({
-      gatewayUpdateImpl: async () =>
-        makeOkUpdateResult({
-          mode: "npm",
-          root: downgradedRoot,
-          before: { version: "2026.4.14" },
-          after: { version: "2026.4.10" },
-        }),
-    });
-    readPackageVersion.mockResolvedValue("2026.4.14");
-    primeNpmChannelTag("latest", "2026.4.10");
-    mockCurrentProcessFreshDoctor();
-
-    await updateCommand({ yes: true, tag: "2026.4.10", restart: false });
-
-    expect(spawn).not.toHaveBeenCalled();
-    expect(syncPluginsForUpdateChannel).toHaveBeenCalledTimes(1);
-    expect(updateNpmInstalledPlugins).toHaveBeenCalledTimes(1);
-    expectFreshPostUpdateDoctor({ yes: true });
     expect(defaultRuntime.exit).not.toHaveBeenCalledWith(1);
   });
 
@@ -5513,7 +5384,6 @@ describe("update-cli", () => {
       ).resolves.toMatchObject({
         inspected: true,
         running: true,
-        serviceMatchesMutationRoot: false,
         serviceUpdateVerdict: { kind: "foreign" },
       });
     } finally {
@@ -7884,8 +7754,9 @@ describe("update-cli", () => {
     } satisfies Record<string, PluginInstallRecord>;
     let currentSnapshot = preDoctorSnapshot;
     vi.mocked(readConfigFileSnapshot).mockImplementation(async () => currentSnapshot);
-    vi.mocked(doctorCommand).mockImplementationOnce(async () => {
+    vi.mocked(runExec).mockImplementationOnce(async () => {
       currentSnapshot = postDoctorSnapshot;
+      return { stdout: "", stderr: "" };
     });
     loadInstalledPluginIndexInstallRecords.mockResolvedValueOnce(postDoctorRecords);
     syncPluginsForUpdateChannel.mockImplementationOnce(
@@ -7989,12 +7860,14 @@ describe("update-cli", () => {
     });
     let currentSnapshot = preDoctorSnapshot;
     vi.mocked(readConfigFileSnapshot).mockImplementation(async () => currentSnapshot);
-    vi.mocked(doctorCommand).mockImplementationOnce(async () => {
+    vi.mocked(runExec).mockImplementationOnce(async () => {
       currentSnapshot = postDoctorSnapshot;
+      return { stdout: "", stderr: "" };
     });
 
     await updateFinalizeCommand({ channel: "dev", json: true, restart: false });
 
+    expectFreshPostUpdateDoctor({ yes: false, workspaceSuggestions: true });
     expect(replaceConfigCall(0)?.baseHash).toBe("pre-doctor");
     expect(replaceConfigCall(0)?.nextConfig).toEqual({ update: { channel: "dev" } });
     expect(replaceConfigCall(1)?.baseHash).toBe("post-doctor");

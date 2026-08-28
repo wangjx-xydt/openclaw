@@ -8,6 +8,11 @@ import { err as resultErr, ok } from "@openclaw/normalization-core/result";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildGatewayInstallPlan } from "../commands/daemon-install-helpers.js";
 import type { ExecResult } from "./exec-file.js";
+import {
+  buildSystemdManagerPropertyOutput,
+  buildSystemdUnitPropertyOutput as serializeSystemdUnitProperties,
+  type SystemdManagerSnapshotFixture,
+} from "./service.test-helpers.js";
 
 type ExecFileError = Error & {
   stderr?: string;
@@ -305,47 +310,17 @@ function mockReadGatewayServiceFile(
   });
 }
 
-type SystemdManagerSnapshotFixture = {
-  programArguments: string[];
-  workingDirectory?: string;
-  environment?: string[];
-  environmentFiles?: Array<[string, boolean]>;
-  unsetEnvironment?: string[];
-  fragmentPath?: string;
-  dropInPaths?: string[];
-  needDaemonReload?: boolean;
-  loadState?: string;
-};
-
-function buildSystemdManagerPropertyOutput(snapshot: SystemdManagerSnapshotFixture): string {
-  return [
-    {
-      type: "a(sasbttttuii)",
-      data: [[snapshot.programArguments[0], snapshot.programArguments, false, 0, 0, 0, 0, 0, 0, 0]],
-    },
-    { type: "s", data: snapshot.workingDirectory ?? "" },
-    { type: "as", data: snapshot.environment ?? [] },
-    { type: "a(sb)", data: snapshot.environmentFiles ?? [] },
-    { type: "as", data: snapshot.unsetEnvironment ?? [] },
-  ]
-    .map((property) => JSON.stringify(property))
-    .join("\n");
-}
-
 function buildSystemdUnitPropertyOutput(
   params: Pick<
     SystemdManagerSnapshotFixture,
     "fragmentPath" | "dropInPaths" | "needDaemonReload" | "loadState"
   >,
 ): string {
-  const fragmentPath =
-    params.fragmentPath ?? `${TEST_SERVICE_HOME}/.config/systemd/user/${GATEWAY_SERVICE}`;
-  return [
-    JSON.stringify({ type: "s", data: fragmentPath }),
-    JSON.stringify({ type: "as", data: params.dropInPaths ?? [] }),
-    JSON.stringify({ type: "b", data: params.needDaemonReload ?? false }),
-    JSON.stringify({ type: "s", data: params.loadState ?? "loaded" }),
-  ].join("\n");
+  return serializeSystemdUnitProperties({
+    ...params,
+    fragmentPath:
+      params.fragmentPath ?? `${TEST_SERVICE_HOME}/.config/systemd/user/${GATEWAY_SERVICE}`,
+  });
 }
 
 function mockSystemdManagerProperties(
@@ -2374,13 +2349,7 @@ describe("stageSystemdService", () => {
       );
 
       await expect(
-        stageSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: { OPENCLAW_GATEWAY_PORT: "18789" },
-        }),
+        stageSystemdService(gatewayPortSystemdServiceFixture(env, "18789")),
       ).rejects.toThrow("system scope owns openclaw-gateway-stage-test.service");
 
       await expect(fs.readFile(unitPath, "utf8")).resolves.toBe(previous);
@@ -2392,55 +2361,6 @@ describe("stageSystemdService", () => {
     });
   });
 
-  it("refuses to rewrite a symlinked managed user unit", async () => {
-    await withStageFixture(async ({ env, unitPath }) => {
-      const targetPath = path.join(path.dirname(unitPath), "operator-gateway.service");
-      const previous = "[Unit]\nDescription=Operator gateway\n";
-      await fs.mkdir(path.dirname(unitPath), { recursive: true });
-      await fs.writeFile(targetPath, previous, "utf8");
-      await fs.symlink(targetPath, unitPath);
-      mockSystemctlStatusOk();
-
-      await expect(
-        stageSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: { OPENCLAW_GATEWAY_PORT: "18789" },
-        }),
-      ).rejects.toThrow(`Refusing to rewrite symlinked managed systemd file: ${unitPath}`);
-
-      await expect(fs.lstat(unitPath)).resolves.toMatchObject({});
-      await expect(fs.readlink(unitPath)).resolves.toBe(targetPath);
-      await expect(fs.readFile(targetPath, "utf8")).resolves.toBe(previous);
-    });
-  });
-
-  it("refuses to rewrite a symlinked managed environment file", async () => {
-    await withStageFixture(async ({ env, envFilePath }) => {
-      const targetPath = path.join(path.dirname(envFilePath), "operator-gateway.env");
-      const previous = "OPENCLAW_GATEWAY_TOKEN=operator-token\n";
-      await fs.writeFile(targetPath, previous, "utf8");
-      await fs.symlink(targetPath, envFilePath);
-      mockSystemctlStatusOk();
-
-      await expect(
-        stageSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: { OPENCLAW_GATEWAY_TOKEN: "new-token" },
-          environmentValueSources: { OPENCLAW_GATEWAY_TOKEN: "file" },
-        }),
-      ).rejects.toThrow(`Refusing to rewrite symlinked managed systemd file: ${envFilePath}`);
-
-      await expect(fs.readlink(envFilePath)).resolves.toBe(targetPath);
-      await expect(fs.readFile(targetPath, "utf8")).resolves.toBe(previous);
-    });
-  });
-
   it("rolls back a new environment file when ownership appears before publication", async () => {
     await withStageFixture(async ({ env, unitPath, envFilePath }) => {
       mockSystemctlStatusOk();
@@ -2449,17 +2369,15 @@ describe("stageSystemdService", () => {
         .mockRejectedValueOnce(new Error("system ownership appeared"));
 
       await expect(
-        stageSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: {
-            OPENCLAW_GATEWAY_PORT: "18789",
-            OPENCLAW_GATEWAY_TOKEN: "new-token",
-          },
-          environmentValueSources: { OPENCLAW_GATEWAY_TOKEN: "file" },
-        }),
+        stageSystemdService(
+          gatewaySystemdServiceFixture(env, {
+            environment: {
+              OPENCLAW_GATEWAY_PORT: "18789",
+              OPENCLAW_GATEWAY_TOKEN: "new-token",
+            },
+            environmentValueSources: { OPENCLAW_GATEWAY_TOKEN: "file" },
+          }),
+        ),
       ).rejects.toThrow("system ownership appeared");
 
       await expect(fs.access(unitPath)).rejects.toMatchObject({ code: "ENOENT" });
@@ -2482,17 +2400,15 @@ describe("stageSystemdService", () => {
         .mockRejectedValueOnce(new Error("system ownership appeared"));
 
       await expect(
-        stageSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: {
-            OPENCLAW_GATEWAY_PORT: "18789",
-            OPENCLAW_GATEWAY_TOKEN: "new-token",
-          },
-          environmentValueSources: { OPENCLAW_GATEWAY_TOKEN: "file" },
-        }),
+        stageSystemdService(
+          gatewaySystemdServiceFixture(env, {
+            environment: {
+              OPENCLAW_GATEWAY_PORT: "18789",
+              OPENCLAW_GATEWAY_TOKEN: "new-token",
+            },
+            environmentValueSources: { OPENCLAW_GATEWAY_TOKEN: "file" },
+          }),
+        ),
       ).rejects.toThrow("system ownership appeared");
 
       const [unitStat, environmentStat] = await Promise.all([
@@ -2534,13 +2450,7 @@ describe("stageSystemdService", () => {
         .mockRejectedValueOnce(new Error("system ownership appeared before activation"));
 
       await expect(
-        installSystemdService({
-          env,
-          stdout: createWritableStreamMock().stdout,
-          programArguments: ["/usr/bin/openclaw", "gateway", "run"],
-          workingDirectory: "/tmp",
-          environment: { OPENCLAW_GATEWAY_PORT: "18789" },
-        }),
+        installSystemdService(gatewayPortSystemdServiceFixture(env, "18789")),
       ).rejects.toThrow("system ownership appeared before activation");
 
       await expect(fs.access(unitPath)).resolves.toBeUndefined();

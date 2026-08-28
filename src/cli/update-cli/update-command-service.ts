@@ -94,19 +94,15 @@ export function shouldPrepareUpdatedInstallRestart(params: {
   serviceInstalled: boolean;
   serviceLoaded: boolean;
   serviceStoppedForUpdate?: boolean;
-  serviceMatchesMutationRoot?: boolean;
   serviceMatchesUpdateRoot?: boolean;
 }): boolean {
   const useInstalledState =
     isPackageManagerUpdateMode(params.updateMode) ||
     (params.updateMode === "git" && params.serviceStoppedForUpdate);
-  return (
-    params.serviceMatchesMutationRoot !== false &&
-    (useInstalledState
-      ? params.serviceInstalled
-      : params.serviceLoaded &&
-        (params.updateMode !== "git" || params.serviceMatchesUpdateRoot === true))
-  );
+  return useInstalledState
+    ? params.serviceInstalled
+    : params.serviceLoaded &&
+        (params.updateMode !== "git" || params.serviceMatchesUpdateRoot === true);
 }
 
 export type PreManagedServiceStop = {
@@ -116,13 +112,25 @@ export type PreManagedServiceStop = {
   running: boolean;
   serviceMutationAllowed?: boolean;
   serviceMutationSkipMessage?: string;
-  serviceMatchesMutationRoot?: boolean;
   serviceUpdateVerdict?: ManagedGatewayUpdateVerdict;
   blockMessage?: string;
   serviceEnv?: NodeJS.ProcessEnv;
   serviceDefinitionEnv?: NodeJS.ProcessEnv;
   windowsTaskAutoStartRecovery?: WindowsTaskAutoStartRecovery;
 };
+
+export function resolvePreparedGatewayUpdatePolicy(
+  stopState: PreManagedServiceStop | undefined,
+  shouldRestart: boolean,
+) {
+  const verdict = stopState?.serviceUpdateVerdict;
+  // Root ownership permits activation; rewriting also requires definition authority.
+  return {
+    allowGatewayServiceRepair: verdict?.kind === "owned" && verdict.refreshDefinition,
+    allowGatewayActivation:
+      shouldRestart && stopState?.stopped === true && verdict?.kind === "owned",
+  };
+}
 
 type ManagedGatewayUpdateVerdict =
   | { kind: "absent" | "foreign" }
@@ -177,6 +185,7 @@ async function inspectManagedGatewayServiceBeforeUpdate(params: {
 function matchesStoppedService(
   before: Pick<PreManagedServiceStop, "serviceEnv" | "serviceUpdateVerdict">,
   state: GatewayServiceState,
+  inspection: ManagedGatewayUpdateVerdict,
 ): boolean {
   const verdict = before.serviceUpdateVerdict;
   const refreshDefinition = verdict?.kind === "owned" && verdict.refreshDefinition;
@@ -196,7 +205,8 @@ function matchesStoppedService(
     resolveGatewayProfileSuffix(before.serviceEnv.OPENCLAW_PROFILE) ===
       resolveGatewayProfileSuffix(state.env.OPENCLAW_PROFILE) &&
     resolveName(before.serviceEnv) === resolveName(state.env) &&
-    (refreshDefinition || sha256Hex(stableStringify(state.command)) === verdict.fingerprint),
+    (refreshDefinition ||
+      ("fingerprint" in inspection && inspection.fingerprint === verdict.fingerprint)),
   );
 }
 
@@ -213,7 +223,7 @@ export async function revalidateManagedGatewayServiceAfterUpdate(params: {
     before &&
     verdict &&
     (verdict.kind === "owned" || verdict.kind === "unresolved") &&
-    (inspection.kind !== verdict.kind || !matchesStoppedService(before, params.state))
+    (inspection.kind !== verdict.kind || !matchesStoppedService(before, params.state, inspection))
   ) {
     throw new GatewayServiceUpdateOwnershipError(
       "Gateway service ownership or manager identity changed; inspect it before restarting manually.",
@@ -491,10 +501,6 @@ export async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     root: params.root,
     state: serviceState,
   });
-  const serviceMatchesMutationRoot =
-    serviceUpdateVerdict.kind === "foreign"
-      ? false
-      : serviceUpdateVerdict.kind === "owned" || undefined;
   const inspected = {
     stopped: false,
     inspected: true,
@@ -502,7 +508,6 @@ export async function maybeStopManagedServiceBeforeMutableUpdate(params: {
     running: serviceState.running,
     serviceEnv: serviceState.env,
     serviceUpdateVerdict,
-    ...(serviceMatchesMutationRoot === undefined ? {} : { serviceMatchesMutationRoot }),
   };
   if (serviceUpdateVerdict.kind === "unavailable") {
     return {
