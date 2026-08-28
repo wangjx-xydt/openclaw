@@ -8,6 +8,7 @@ import {
   readPluginInstallRecords,
   writePluginInstallIndexForE2E,
 } from "../plugin-index-sqlite.mjs";
+import { runConsentScenario } from "./consent-scenario.mjs";
 
 const home = os.homedir();
 const OUTPUT_TAIL_BYTES = 64 * 1024;
@@ -345,6 +346,7 @@ function assertDisabledPluginPolicyPreserved(configPath, pluginId) {
 
 const [command, arg, arg2] = process.argv.slice(2);
 const commands = {
+  consent: () => runConsentScenario(arg, arg2),
   "legacy-compat": () => console.log(legacyPackageAcceptanceCompat(arg || "") ? "1" : "0"),
   seed: seedInstallState,
   "wait-registry": waitRegistry,
