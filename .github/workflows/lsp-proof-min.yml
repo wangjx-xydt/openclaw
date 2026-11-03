@@ -23,6 +23,8 @@ jobs:
         run: pnpm exec vitest run src/process/owned-stdio.real.test.ts
       - name: Run shipped-entry LSP cleanup proof over a real child process
         run: pnpm exec vitest run src/process/lsp-proof.real.test.ts
+      - name: Run shipped Gateway lifecycle LSP cleanup proof
+        run: pnpm exec vitest run src/gateway/lsp-proof.gateway.test.ts
 
   linux-proof:
     runs-on: ubuntu-latest
