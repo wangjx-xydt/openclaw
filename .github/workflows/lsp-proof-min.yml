@@ -1,0 +1,23 @@
+name: lsp-proof-min
+
+on:
+  push:
+    branches: [ "lsp-proof-min" ]
+  workflow_dispatch:
+
+jobs:
+  windows-min:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+      - name: Install deps
+        run: pnpm install --ignore-scripts --frozen-lockfile=false
+      - name: Run minimal real-process proof
+        run: node --import ./scripts/tsx.mjs scripts/lsp-proof-min.mts
