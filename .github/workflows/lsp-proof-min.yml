@@ -19,6 +19,8 @@ jobs:
         run: pnpm install --ignore-scripts --frozen-lockfile=false
       - name: Run minimal real-process proof
         run: node --import ./scripts/tsx.mjs scripts/lsp-proof-min.mts
+      - name: Verify vitest real-process environment on Windows
+        run: pnpm exec vitest run src/process/owned-stdio.real.test.ts --reporter=basic
 
   linux-proof:
     runs-on: ubuntu-latest
