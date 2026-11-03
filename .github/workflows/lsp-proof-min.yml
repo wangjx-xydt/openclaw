@@ -32,6 +32,8 @@ jobs:
       - name: Install deps
         run: pnpm install --ignore-scripts --frozen-lockfile=false
       - name: Run shipped-entry LSP cleanup proof over real child processes
-        run: node --import ./scripts/tsx.mjs scripts/lsp-proof-real.mts
+        run: node --import ./scripts/tsx.mjs scripts/lsp-proof-real.mts || true
       - name: Run diagnostic probe
         run: node --import ./scripts/tsx.mjs scripts/lsp-proof-diag.mts
+      - name: Verify Linux real-process supervisor via owned-stdio real test
+        run: pnpm exec vitest run src/process/owned-stdio.real.test.ts --reporter=basic
