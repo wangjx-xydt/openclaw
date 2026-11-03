@@ -19,3 +19,17 @@ jobs:
         run: pnpm install --ignore-scripts --frozen-lockfile=false
       - name: Run minimal real-process proof
         run: node --import ./scripts/tsx.mjs scripts/lsp-proof-min.mts
+
+  linux-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Enable pnpm via corepack
+        run: corepack enable && pnpm --version
+      - name: Install deps
+        run: pnpm install --ignore-scripts --frozen-lockfile=false
+      - name: Run shipped-entry LSP cleanup proof over real child processes
+        run: node --import ./scripts/tsx.mjs scripts/lsp-proof-real.mts
