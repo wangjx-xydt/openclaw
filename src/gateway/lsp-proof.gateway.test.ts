@@ -6,7 +6,6 @@
 // completeGatewayClose). The Gateway's real "bundle-lsp" shutdown step calls
 // disposeAllBundleLspRuntimes, which must still observe the failed session and
 // report cleanup uncertainty instead of a silent clean close.
-import "./server-worker-free.test-support.js";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
