@@ -1,16 +1,18 @@
 // Real LSP server child for the #190989 proof.
 //
-// It completes the LSP `initialize` handshake over stdio, then spawns a
-// detached descendant that keeps the root's stdout/stderr write ends open.
-// The relay/supervisor cannot confirm descendant extinction for that detached
-// tree, which is exactly the failure shape `closeOwnedStdioProcess()` throws
-// when it cannot certify closure.
+// Completes the LSP `initialize` handshake over stdio, then spawns a detached
+// descendant that inherits this process's stdout/stderr write ends. The root
+// then exits, re-parenting the detached descendant to the OS so the process
+// owner can no longer reach it through the root's PID tree. The leaked
+// descendant keeps the relay/supervisor's stdio pipes open, so the owner
+// cannot certify descendant extinction when the session is disposed — the
+// exact failure shape closeOwnedStdioProcess() throws.
 import { spawn } from "node:child_process";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 let buffer = Buffer.alloc(0);
-let keepAlive;
-const DETACHED_KEEP_ALIVE_MS = Number(process.env.LSP_DETACHED_KEEP_ALIVE_MS ?? 30000);
+let leaked = false;
+const DETACHED_KEEP_ALIVE_MS = Number(process.env.LSP_DETACHED_KEEP_ALIVE_MS ?? 60000);
 
 function encode(body) {
   const json = JSON.stringify(body);
@@ -19,6 +21,34 @@ function encode(body) {
 
 function respond(id, result) {
   process.stdout.write(encode({ jsonrpc: "2.0", id, result }));
+}
+
+function leakAndExit() {
+  if (leaked) {
+    return;
+  }
+  leaked = true;
+  // A detached descendant inheriting stdout/stderr keeps the owner's pipes
+  // open after this root exits and re-parents the leak, out of reach of a
+  // process-tree kill rooted at this process.
+  const leak = spawn(process.execPath, ["-e", `
+    process.stdout.on("error", () => {});
+    process.stderr.on("error", () => {});
+    const until = Date.now() + ${DETACHED_KEEP_ALIVE_MS};
+    const tick = () => {
+      process.stdout.write("leaked-line\\n");
+      if (Date.now() < until) {
+        setTimeout(tick, 500);
+      } else {
+        process.exit(0);
+      }
+    };
+    tick();
+  `], { stdio: ["ignore", "inherit", "inherit"], detached: true });
+  leak.unref();
+  // Exit after the leak is admitted; ownership of the pipes transfers to the
+  // detached descendant.
+  setTimeout(() => process.exit(0), 50);
 }
 
 function handleMessage(message) {
@@ -32,31 +62,10 @@ function handleMessage(message) {
       },
       serverInfo: { name: "lsp-proof-fail-server", version: "1.0.0" },
     });
-    // After the handshake, leak a detached descendant that inherits this
-    // process's stdout/stderr pipes. It keeps the relay's write ends open and
-    // escapes the supervisor's process-group kill, so the owner cannot certify
-    // descendant extinction when the session is disposed.
-    const leak = spawn(process.execPath, ["-e", `
-      process.stdout.on("error", () => {});
-      process.stderr.on("error", () => {});
-      const until = Date.now() + ${DETACHED_KEEP_ALIVE_MS};
-      const tick = () => {
-        process.stdout.write("leaked-line\\n");
-        if (Date.now() < until) {
-          setTimeout(tick, 500);
-        } else {
-          process.exit(0);
-        }
-      };
-      tick();
-    `], { stdio: ["ignore", "inherit", "inherit"], detached: true });
-    leak.unref();
-    keepAlive = setInterval(() => {}, 1000);
-    keepAlive.unref?.();
+    leakAndExit();
   } else if (message.method === "shutdown") {
     respond(message.id, null);
   } else if (message.method === "exit") {
-    clearInterval(keepAlive);
     process.exit(0);
   }
 }
@@ -94,4 +103,3 @@ process.stdin.on("data", (chunk) => {
 });
 
 process.stdin.resume();
-process.stdout.write(encode({ jsonrpc: "2.0", method: "initialized", params: {} }));

@@ -20,7 +20,9 @@ jobs:
       - name: Run minimal real-process proof
         run: node --import ./scripts/tsx.mjs scripts/lsp-proof-min.mts
       - name: Verify vitest real-process environment on Windows
-        run: pnpm exec vitest run src/process/owned-stdio.real.test.ts 
+        run: pnpm exec vitest run src/process/owned-stdio.real.test.ts
+      - name: Run shipped-entry LSP cleanup proof over a real child process
+        run: pnpm exec vitest run src/process/lsp-proof.real.test.ts
 
   linux-proof:
     runs-on: ubuntu-latest
